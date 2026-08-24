@@ -134,6 +134,23 @@ use crate::tdbe::types::enums::{RemoveReason, SecType, StreamMsgType};
 
 use self::protocol::{build_login_payload, build_subscribe_payload, Contract, SubscriptionKind};
 
+/// Synchronous typed-event destination for applications whose native ingress
+/// is fast enough to run directly on the FPSS I/O thread.
+pub trait DirectEventSink: Send + 'static {
+    /// Receive one decoded data or control event before the next wire frame is
+    /// read. Implementations must hand the event directly to native ownership.
+    fn on_event(&mut self, event: &StreamEvent);
+}
+
+impl<F> DirectEventSink for F
+where
+    F: FnMut(&StreamEvent) + Send + 'static,
+{
+    fn on_event(&mut self, event: &StreamEvent) {
+        self(event);
+    }
+}
+
 /// Capacity of the bounded command channel from the public surface and the
 /// ping thread to the I/O thread.
 ///
@@ -467,6 +484,7 @@ pub struct StreamingClientBuilder<'a> {
     creds: &'a Credentials,
     hosts: &'a [(String, u16)],
     ring_size: usize,
+    request_id_start: i64,
     policy: ReconnectPolicy,
     wait_ms: u64,
     wait_max_ms: u64,
@@ -554,6 +572,7 @@ impl<'a> StreamingClientBuilder<'a> {
             creds,
             hosts,
             ring_size,
+            request_id_start: 1,
             policy: policy.clone(),
             wait_ms,
             wait_max_ms,
@@ -575,6 +594,13 @@ impl<'a> StreamingClientBuilder<'a> {
             ),
             consumer_cpu,
         }
+    }
+
+    /// First request identifier allocated by the streaming session.
+    #[must_use]
+    pub fn request_id_start(mut self, request_id: i64) -> Self {
+        self.request_id_start = request_id;
+        self
     }
 
     /// Event ring buffer size (events). Must be a power of two.
@@ -746,7 +772,16 @@ impl<'a> StreamingClientBuilder<'a> {
     /// failure, and other variants on protocol violations or
     /// configuration validation errors.
     pub fn build(self) -> Result<StreamingClient, StreamError> {
-        StreamingClient::connect(self.into_args()).map_err(StreamError::from)
+        StreamingClient::connect(self.into_args(), None).map_err(StreamError::from)
+    }
+
+    /// Connect with decoded events delivered synchronously on the FPSS I/O
+    /// thread. This path never publishes an event into the event ring.
+    pub fn build_direct<S>(self, sink: S) -> Result<StreamingClient, StreamError>
+    where
+        S: DirectEventSink,
+    {
+        StreamingClient::connect(self.into_args(), Some(Box::new(sink))).map_err(StreamError::from)
     }
 
     pub(crate) fn into_args(self) -> FpssConnectArgs<'a> {
@@ -754,6 +789,7 @@ impl<'a> StreamingClientBuilder<'a> {
             creds: self.creds,
             hosts: self.hosts,
             ring_size: self.ring_size,
+            request_id_start: self.request_id_start,
             policy: self.policy,
             wait_ms: self.wait_ms,
             wait_max_ms: self.wait_max_ms,
@@ -788,6 +824,7 @@ pub(crate) struct FpssConnectArgs<'a> {
     pub(crate) creds: &'a Credentials,
     pub(crate) hosts: &'a [(String, u16)],
     pub(crate) ring_size: usize,
+    pub(crate) request_id_start: i64,
     pub(crate) policy: ReconnectPolicy,
     pub(crate) wait_ms: u64,
     pub(crate) wait_max_ms: u64,
@@ -873,12 +910,13 @@ pub enum HarnessPublishMode {
 /// matching the [`FpssConnectArgs`] convention.
 struct SpawnArgs<'a, P> {
     producer: P,
-    poller: EventPoller<RingEvent, SingleProducerBarrier>,
+    poller: Option<EventPoller<RingEvent, SingleProducerBarrier>>,
     stream: connection::FpssStream,
     cmd_rx: std_mpsc::Receiver<IoCommand>,
     cmd_tx: std_mpsc::SyncSender<IoCommand>,
     ping_cmd_tx: std_mpsc::SyncSender<IoCommand>,
     ring_size: usize,
+    client_ring_size: usize,
     permissions: String,
     pending_control: Vec<StreamControl>,
     server_addr: String,
@@ -1110,11 +1148,15 @@ impl StreamingClient {
     /// &StreamingClient` impl.
     ///
     /// Crate-internal — public callers use [`Self::builder`].
-    pub(crate) fn connect(args: FpssConnectArgs<'_>) -> Result<Self, Error> {
+    pub(crate) fn connect(
+        args: FpssConnectArgs<'_>,
+        direct_sink: Option<Box<dyn DirectEventSink>>,
+    ) -> Result<Self, Error> {
         let FpssConnectArgs {
             creds,
             hosts,
             ring_size,
+            request_id_start,
             policy,
             wait_ms,
             wait_max_ms,
@@ -1235,7 +1277,7 @@ impl StreamingClient {
             keepalive,
             &AtomicBool::new(false),
         )?;
-        Self::connect_with_stream(connection::ConnectWithStreamArgs {
+        let stream_args = connection::ConnectWithStreamArgs {
             creds,
             stream,
             server_addr,
@@ -1256,7 +1298,13 @@ impl StreamingClient {
             io_read_slice: Duration::from_millis(io_read_slice_ms),
             keepalive,
             ping_interval: Duration::from_millis(ping_interval_ms),
-        })
+        };
+        match direct_sink {
+            Some(sink) => {
+                Self::connect_with_stream_delivery(stream_args, request_id_start, Some(sink))
+            }
+            None => Self::connect_with_stream(stream_args),
+        }
     }
 
     /// Connect using a pre-established stream (for testing with mock sockets).
@@ -1270,6 +1318,14 @@ impl StreamingClient {
     /// [`Self::for_each`] or the `Iterator` impl.
     pub(crate) fn connect_with_stream(
         args: connection::ConnectWithStreamArgs<'_>,
+    ) -> Result<Self, Error> {
+        Self::connect_with_stream_delivery(args, 1, None)
+    }
+
+    fn connect_with_stream_delivery(
+        args: connection::ConnectWithStreamArgs<'_>,
+        request_id_start: i64,
+        direct_sink: Option<Box<dyn DirectEventSink>>,
     ) -> Result<Self, Error> {
         let connection::ConnectWithStreamArgs {
             creds,
@@ -1387,7 +1443,7 @@ impl StreamingClient {
         // owns one handle for caller-issued subscribes; the io_loop
         // borrows another so re-subscribe frames on auto-reconnect
         // allocate fresh ids correlatable through `ReqResponse`.
-        let next_req_id: Arc<AtomicI64> = Arc::new(AtomicI64::new(1));
+        let next_req_id: Arc<AtomicI64> = Arc::new(AtomicI64::new(request_id_start));
 
         // Staleness clock shared with the I/O thread: UNIX nanoseconds
         // of the most recent inbound frame (login handshake counts —
@@ -1421,8 +1477,29 @@ impl StreamingClient {
         // every published sequence, the drain paths record batch
         // completions.
         let ring_cursors = Arc::new(RingCursors::new());
-        let (producer, poller) =
-            io_loop::build_poller_producer(ring_size, Arc::clone(&ring_cursors), wait_strategy);
+        let producer_ring_size = if direct_sink.is_some() {
+            ring::MIN_RING_SIZE
+        } else {
+            ring_size
+        };
+        let (ring_producer, poller) = io_loop::build_poller_producer(
+            producer_ring_size,
+            Arc::clone(&ring_cursors),
+            wait_strategy,
+        );
+        let (producer, poller, client_ring_size) = if let Some(sink) = direct_sink {
+            (
+                ring::DeliveryProducer::Direct(ring::DirectSinkProducer::new(sink)),
+                None,
+                0,
+            )
+        } else {
+            (
+                ring::DeliveryProducer::Ring(ring_producer),
+                Some(poller),
+                ring_size,
+            )
+        };
 
         // Build the client with the producer + poller bundled in. The
         // poller lives inside `StreamingClient::poller_state` and is drained
@@ -1435,7 +1512,8 @@ impl StreamingClient {
             cmd_rx,
             cmd_tx,
             ping_cmd_tx,
-            ring_size,
+            ring_size: producer_ring_size,
+            client_ring_size,
             permissions,
             pending_control,
             server_addr,
@@ -1487,6 +1565,7 @@ impl StreamingClient {
             cmd_tx,
             ping_cmd_tx,
             ring_size,
+            client_ring_size,
             permissions,
             pending_control,
             server_addr,
@@ -1614,7 +1693,7 @@ impl StreamingClient {
             cmd_tx: Mutex::new(cmd_tx),
             io_handle: Some(io_handle),
             ping_handle: Some(ping_handle),
-            poller_state: Mutex::new(Some(PollerState {
+            poller_state: Mutex::new(poller.map(|poller| PollerState {
                 poller,
                 pending: VecDeque::new(),
                 consumed_seq: -1,
@@ -1635,7 +1714,7 @@ impl StreamingClient {
             panics,
             io_faulted,
             ring_cursors,
-            ring_size,
+            ring_size: client_ring_size,
             wait_strategy,
             consumer_cpu,
             consumer_pinned_to: Mutex::new(None),
@@ -2272,6 +2351,16 @@ impl StreamingClient {
         }
     }
 
+    /// Subscribe to one contract and return the exact request identifier sent
+    /// on the FPSS wire for response correlation.
+    pub fn subscribe_contract_with_request_id(
+        &self,
+        contract: Contract,
+        kind: SubscriptionKind,
+    ) -> Result<i32, Error> {
+        self.send_sub_contract(kind, &contract)
+    }
+
     /// Polymorphic unsubscribe — wire-level counterpart to
     /// [`Self::subscribe`].
     ///
@@ -2317,7 +2406,7 @@ impl StreamingClient {
         if unsubscribe {
             self.send_unsub_contract(kind, contract)
         } else {
-            self.send_sub_contract(kind, contract)
+            self.send_sub_contract(kind, contract).map(|_| ())
         }
     }
 
@@ -2439,7 +2528,7 @@ impl StreamingClient {
     }
 
     /// Per-contract subscribe wire emission.
-    fn send_sub_contract(&self, kind: SubscriptionKind, contract: &Contract) -> Result<(), Error> {
+    fn send_sub_contract(&self, kind: SubscriptionKind, contract: &Contract) -> Result<i32, Error> {
         contract.validate()?;
         self.check_connected()?;
 
@@ -2476,7 +2565,7 @@ impl StreamingClient {
             contract = %contract,
             "sent subscription"
         );
-        Ok(())
+        Ok(req_id)
     }
 
     /// Per-contract unsubscribe wire emission.
