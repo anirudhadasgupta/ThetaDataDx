@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 use disruptor::{Producer, RingBufferFull, Sequence};
 
 use super::events::FpssEventInternal;
+use super::DirectEventSink;
 use crate::config::WaitMode;
 use crate::util::cache_padded::CachePadded;
 
@@ -319,6 +320,83 @@ pub trait RingProducer: Send + 'static {
     fn publish<F>(&mut self, update: F)
     where
         F: FnOnce(&mut RingEvent);
+}
+
+/// Event publisher that invokes a caller-owned sink synchronously on the
+/// FPSS I/O thread. It has no intermediate ring and cannot overflow.
+pub(in crate::fpss) struct DirectSinkProducer {
+    sink: Box<dyn DirectEventSink>,
+    slot: RingEvent,
+    next_sequence: Sequence,
+}
+
+impl DirectSinkProducer {
+    pub(in crate::fpss) fn new(sink: Box<dyn DirectEventSink>) -> Self {
+        Self {
+            sink,
+            slot: RingEvent::default(),
+            next_sequence: 0,
+        }
+    }
+}
+
+impl RingProducer for DirectSinkProducer {
+    #[inline]
+    fn try_publish<F>(&mut self, update: F) -> Result<Sequence, RingBufferFull>
+    where
+        F: FnOnce(&mut RingEvent),
+    {
+        update(&mut self.slot);
+        if let Some(event) = self.slot.event.as_public() {
+            self.sink.on_event(event);
+        }
+        self.slot.event = FpssEventInternal::Empty;
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(sequence)
+    }
+
+    #[cfg(any(test, feature = "__test-helpers"))]
+    #[inline]
+    fn publish<F>(&mut self, update: F)
+    where
+        F: FnOnce(&mut RingEvent),
+    {
+        let _ = self.try_publish(update);
+    }
+}
+
+pub(in crate::fpss) enum DeliveryProducer<P> {
+    Ring(P),
+    Direct(DirectSinkProducer),
+}
+
+impl<P> RingProducer for DeliveryProducer<P>
+where
+    P: RingProducer,
+{
+    #[inline]
+    fn try_publish<F>(&mut self, update: F) -> Result<Sequence, RingBufferFull>
+    where
+        F: FnOnce(&mut RingEvent),
+    {
+        match self {
+            Self::Ring(producer) => producer.try_publish(update),
+            Self::Direct(producer) => producer.try_publish(update),
+        }
+    }
+
+    #[cfg(any(test, feature = "__test-helpers"))]
+    #[inline]
+    fn publish<F>(&mut self, update: F)
+    where
+        F: FnOnce(&mut RingEvent),
+    {
+        match self {
+            Self::Ring(producer) => producer.publish(update),
+            Self::Direct(producer) => producer.publish(update),
+        }
+    }
 }
 
 /// [`RingProducer`] adapter that records each successfully published
